@@ -31,6 +31,11 @@ struct TeleprompterView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .bottomTrailing) {
+            ResizeGrip(model: model)
+                .opacity(hovering && !model.isEditing ? 0.9 : 0)
+                .animation(.easeInOut(duration: 0.15), value: hovering)
+        }
         .onHover { hovering = $0 }
     }
 
@@ -50,51 +55,84 @@ private struct PrompterStrip: View {
     @ObservedObject var model: TeleprompterModel
 
     var body: some View {
-        GeometryReader { geo in
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 14) {
-                        // Leading inset so the first word can sit at center.
-                        Color.clear.frame(width: geo.size.width / 2)
-                        ForEach(model.words) { word in
-                            Text(word.text)
-                                .font(.system(size: model.fontSize,
-                                               weight: .semibold, design: .rounded))
-                                .foregroundStyle(color(for: word))
-                                .fixedSize()
-                                .id(word.id)
-                                .contentShape(Rectangle())
-                                .onTapGesture { model.jump(to: word.id) }
-                                .scaleEffect(word.id == model.currentIndex ? 1.0 : 0.96)
-                                .animation(.easeOut(duration: 0.2), value: model.currentIndex)
-                        }
-                        Color.clear.frame(width: geo.size.width / 2)
-                    }
-                    .padding(.vertical, 6)
-                }
-                .onChange(of: model.currentIndex) { _, idx in
-                    withAnimation(.easeInOut(duration: 0.28)) {
-                        proxy.scrollTo(idx, anchor: .center)
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                FlowLayout(spacing: 12, lineSpacing: max(6, model.fontSize * 0.28)) {
+                    ForEach(model.words) { word in
+                        Text(word.text)
+                            .font(.system(size: model.fontSize,
+                                           weight: .semibold, design: .rounded))
+                            .foregroundStyle(color(for: word))
+                            .fixedSize()
+                            .id(word.id)
+                            .contentShape(Rectangle())
+                            .onTapGesture { model.jump(to: word.id) }
                     }
                 }
-                .onAppear { proxy.scrollTo(model.currentIndex, anchor: .center) }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // Top & bottom breathing room so the first/last lines can scroll
+                // to the active anchor position and older text stays visible.
+                .padding(.vertical, 8)
             }
-            // Center guide line under the active word.
-            .overlay(alignment: .center) {
-                Rectangle()
-                    .fill(.white.opacity(0.06))
-                    .frame(width: 2)
-                    .allowsHitTesting(false)
+            .onChange(of: model.currentIndex) { _, idx in
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    // Keep the active word ~40% down: leaves a line or two of
+                    // already-spoken text above it for context.
+                    proxy.scrollTo(idx, anchor: UnitPoint(x: 0.5, y: 0.42))
+                }
             }
+            .onChange(of: model.fontSize) { _, _ in
+                proxy.scrollTo(model.currentIndex, anchor: UnitPoint(x: 0.5, y: 0.42))
+            }
+            .onAppear { proxy.scrollTo(model.currentIndex, anchor: UnitPoint(x: 0.5, y: 0.42)) }
         }
     }
 
     private func color(for word: ScriptWord) -> Color {
-        if word.id < model.currentIndex { return .white.opacity(0.28) }   // spoken
+        if word.id < model.currentIndex { return .white.opacity(0.3) }    // spoken
         if word.id == model.currentIndex {                                 // up next
             return model.paused ? .orange : .green
         }
         return .white.opacity(0.92)                                        // upcoming
+    }
+}
+
+// MARK: - Flow layout (wraps words onto multiple lines)
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 12
+    var lineSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, lineHeight: CGFloat = 0, maxLineWidth: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                maxLineWidth = max(maxLineWidth, x - spacing)
+                x = 0; y += lineHeight + lineSpacing; lineHeight = 0
+            }
+            x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+        maxLineWidth = max(maxLineWidth, x - spacing)
+        let width = maxWidth.isFinite ? maxWidth : maxLineWidth
+        return CGSize(width: width, height: y + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxWidth = bounds.width
+        var x: CGFloat = 0, y: CGFloat = 0, lineHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0; y += lineHeight + lineSpacing; lineHeight = 0
+            }
+            sub.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y),
+                      anchor: .topLeading, proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
     }
 }
 
@@ -167,6 +205,32 @@ private struct ControlBar: View {
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+}
+
+// MARK: - Resize grip
+
+private struct ResizeGrip: View {
+    @ObservedObject var model: TeleprompterModel
+    @State private var dragging = false
+
+    var body: some View {
+        Image(systemName: "arrow.down.right")
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(.white.opacity(0.7))
+            .frame(width: 22, height: 22)
+            .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+            .padding(6)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        if !dragging { dragging = true; model.beginResize?() }
+                        model.updateResize?(value.translation)
+                    }
+                    .onEnded { _ in dragging = false }
+            )
+            .help("Drag to resize")
     }
 }
 

@@ -28,17 +28,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingPanel?
     private let model = TeleprompterModel()
 
-    static let collapsedHeight: CGFloat = 110
-    static let expandedHeight: CGFloat = 320
-    static let width: CGFloat = 820
+    static let initialWidth: CGFloat = 820
+    static let initialHeight: CGFloat = 130
+    static let minWidth: CGFloat = 320
+    static let minHeight: CGFloat = 70
+    static let editMinHeight: CGFloat = 240
+
+    /// Captured at the start of a corner-grip resize.
+    private var resizeStartFrame: NSRect = .zero
+    /// Frame remembered before we grew the panel to fit the editor.
+    private var frameBeforeEdit: NSRect?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Menu-bar / overlay app: no Dock icon.
         NSApp.setActivationPolicy(.accessory)
 
         let panel = FloatingPanel(
-            contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.collapsedHeight),
-            styleMask: [.borderless, .nonactivatingPanel],
+            contentRect: NSRect(x: 0, y: 0, width: Self.initialWidth, height: Self.initialHeight),
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -50,33 +57,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
+        panel.minSize = NSSize(width: Self.minWidth, height: Self.minHeight)
+        panel.maxSize = NSSize(width: 100_000, height: 100_000)
 
         let root = TeleprompterView(model: model)
             .environmentObject(model)
         panel.contentView = NSHostingView(rootView: root)
 
         self.panel = panel
-        positionUnderNotch(height: Self.collapsedHeight)
+        positionUnderNotch(width: Self.initialWidth, height: Self.initialHeight)
         panel.makeKeyAndOrderFront(nil)
 
-        // Grow/shrink the panel when entering/leaving edit mode, keeping the
-        // top edge fixed so it stays pinned near the notch.
+        // Make sure the editor has room: grow if the box is too short, then
+        // restore the user's chosen size when editing ends.
         model.onEditingChange = { [weak self] editing in
-            self?.positionUnderNotch(height: editing ? Self.expandedHeight : Self.collapsedHeight)
+            guard let self, let panel = self.panel else { return }
+            if editing {
+                if panel.frame.height < Self.editMinHeight {
+                    self.frameBeforeEdit = panel.frame
+                    self.setHeightKeepingTop(Self.editMinHeight)
+                }
+            } else if let prior = self.frameBeforeEdit {
+                panel.setFrame(prior, display: true, animate: true)
+                self.frameBeforeEdit = nil
+            }
         }
         model.onQuit = { NSApp.terminate(nil) }
         model.requestFront = { [weak self] in self?.panel?.makeKeyAndOrderFront(nil) }
+
+        // Corner-grip resize: grow right & down, keeping the top edge pinned.
+        model.beginResize = { [weak self] in
+            guard let self, let panel = self.panel else { return }
+            self.resizeStartFrame = panel.frame
+        }
+        model.updateResize = { [weak self] translation in
+            guard let self, let panel = self.panel else { return }
+            let f = self.resizeStartFrame
+            let newW = max(Self.minWidth, f.width + translation.width)
+            let newH = max(Self.minHeight, f.height + translation.height)
+            panel.setFrame(NSRect(x: f.minX, y: f.maxY - newH, width: newW, height: newH),
+                           display: true)
+        }
+    }
+
+    private func setHeightKeepingTop(_ height: CGFloat) {
+        guard let panel else { return }
+        let f = panel.frame
+        panel.setFrame(NSRect(x: f.minX, y: f.maxY - height, width: f.width, height: height),
+                       display: true, animate: true)
     }
 
     /// Center horizontally and pin just below the menu bar / notch.
-    private func positionUnderNotch(height: CGFloat) {
+    private func positionUnderNotch(width: CGFloat, height: CGFloat) {
         guard let panel, let screen = NSScreen.main else { return }
         let full = screen.frame
         let visible = screen.visibleFrame
         let topOfContent = visible.maxY   // just under the menu bar
-        let x = full.minX + (full.width - Self.width) / 2
+        let x = full.minX + (full.width - width) / 2
         let y = topOfContent - height
-        panel.setFrame(NSRect(x: x, y: y, width: Self.width, height: height),
+        panel.setFrame(NSRect(x: x, y: y, width: width, height: height),
                        display: true, animate: true)
     }
 }

@@ -43,12 +43,19 @@ final class TeleprompterModel: ObservableObject {
     var onEditingChange: ((Bool) -> Void)?
     var onQuit: (() -> Void)?
     var requestFront: (() -> Void)?
+    var beginResize: (() -> Void)?
+    var updateResize: ((CGSize) -> Void)?
 
     let speech = SpeechRecognizer()
 
-    /// Per-segment matching anchor: the cursor position when the current
-    /// speech segment began. Alignment is recomputed from here each callback.
-    private var segmentBase = 0
+    /// How many recognized tokens (within the current speech segment) we've
+    /// already used to drive the cursor, and the size of the latest transcript.
+    /// Tracked incrementally so each new spoken word advances at most once.
+    private var processedTokens = 0
+    private var lastTokenCount = 0
+    /// How far ahead of the cursor we'll look for a spoken word. Lets the
+    /// prompter catch up when recognition lags or jump forward if you skip.
+    private let lookahead = 12
     private var autoTimer: Timer?
 
     init() {
@@ -59,7 +66,9 @@ final class TeleprompterModel: ObservableObject {
             self?.consume(tokens: tokens)
         }
         speech.onSegmentReset = { [weak self] in
-            self?.segmentBase = self?.currentIndex ?? 0
+            // New segment => transcript starts empty again.
+            self?.processedTokens = 0
+            self?.lastTokenCount = 0
         }
         $script
             .debounce(for: .seconds(0.4), scheduler: RunLoop.main)
@@ -81,16 +90,15 @@ final class TeleprompterModel: ObservableObject {
         }
         words = result
         if currentIndex > words.count { currentIndex = words.count }
-        segmentBase = min(segmentBase, words.count)
     }
 
     // MARK: - Cursor control
 
     func jump(to index: Int) {
         currentIndex = max(0, min(index, words.count))
-        segmentBase = currentIndex
-        // Clear any in-flight transcription so old audio can't re-advance us.
-        if voiceEnabled { speech.start() }
+        // Ignore anything already said in this segment so old audio can't
+        // re-advance us — but DON'T restart the recognizer (that would kill it).
+        processedTokens = lastTokenCount
     }
 
     func restart() {
@@ -101,38 +109,80 @@ final class TeleprompterModel: ObservableObject {
 
     // MARK: - Speech-driven advancement
 
-    /// Greedy alignment of spoken tokens onto the upcoming script words,
-    /// starting from the segment anchor. Idempotent: safe to recompute on every
-    /// partial result. Tolerates a single skipped/misheard word.
+    /// Process the running transcript incrementally: only newly recognized
+    /// tokens drive the cursor, and each is matched against a *window* of
+    /// upcoming words. This lets the prompter jump forward to whatever word you
+    /// actually said (e.g. you say "three" in "one two three four" -> it lands
+    /// on "three") and catch up when recognition lags behind your voice.
     private func consume(tokens: [String]) {
-        guard voiceEnabled, !paused, !isEditing else { return }
-        var s = segmentBase
-        var t = 0
-        while t < tokens.count && s < words.count {
-            let spoken = tokens[t]
-            if Self.matches(words[s].clean, spoken) {
-                s += 1; t += 1
-            } else if s + 1 < words.count && Self.matches(words[s + 1].clean, spoken) {
-                // Speaker skipped/omitted one word — move past it.
-                s += 2; t += 1
-            } else {
-                // Unrecognized filler / mis-hear — skip the spoken token.
-                t += 1
+        guard voiceEnabled, !paused, !isEditing else {
+            // Discard anything spoken while paused/editing so it can't advance
+            // the cursor once we resume.
+            processedTokens = tokens.count
+            lastTokenCount = tokens.count
+            return
+        }
+        // A partial result occasionally shrinks as the recognizer revises;
+        // reprocess from the start of the (now shorter) transcript.
+        if tokens.count < processedTokens { processedTokens = 0 }
+
+        var newIndex = currentIndex
+        for i in processedTokens..<tokens.count {
+            if let landed = matchForward(spoken: tokens[i], from: newIndex) {
+                newIndex = landed + 1
             }
         }
-        if s > currentIndex {
-            withAnimation(.easeOut(duration: 0.25)) { currentIndex = s }
+        processedTokens = tokens.count
+        lastTokenCount = tokens.count
+
+        if newIndex > currentIndex {
+            withAnimation(.easeOut(duration: 0.22)) { currentIndex = newIndex }
         }
+    }
+
+    /// Find the nearest upcoming word (within `lookahead`) that the spoken
+    /// token matches. Returns its index, or nil if nothing nearby matches
+    /// (filler words / mis-hears are simply ignored). Only ever looks forward,
+    /// so voice never drags the cursor backward — tapping handles that.
+    private func matchForward(spoken: String, from start: Int) -> Int? {
+        guard !spoken.isEmpty else { return nil }
+        let end = min(words.count, start + lookahead)
+        guard start < end else { return nil }
+        for idx in start..<end where Self.matches(words[idx].clean, spoken) {
+            return idx
+        }
+        return nil
     }
 
     private static func matches(_ scriptWord: String, _ spoken: String) -> Bool {
         guard !scriptWord.isEmpty, !spoken.isEmpty else { return false }
         if scriptWord == spoken { return true }
-        // Tolerate plural / tense endings and minor recognition slips.
+        // Tolerate plural / tense endings (prefix overlap on longer words).
         if scriptWord.count >= 4 && spoken.count >= 4 {
             if scriptWord.hasPrefix(spoken) || spoken.hasPrefix(scriptWord) { return true }
         }
+        // Tolerate a single-character recognition slip on longer words.
+        if scriptWord.count >= 5 && spoken.count >= 5
+            && abs(scriptWord.count - spoken.count) <= 1
+            && levenshtein(scriptWord, spoken) <= 1 {
+            return true
+        }
         return false
+    }
+
+    private static func levenshtein(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        var prev = Array(0...b.count)
+        var curr = [Int](repeating: 0, count: b.count + 1)
+        for i in 1...a.count {
+            curr[0] = i
+            for j in 1...b.count {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+            }
+            swap(&prev, &curr)
+        }
+        return prev[b.count]
     }
 
     // MARK: - Transport
@@ -143,7 +193,8 @@ final class TeleprompterModel: ObservableObject {
             autoEnabled = false
             stopAutoTimer()
             paused = false
-            segmentBase = currentIndex
+            processedTokens = 0
+            lastTokenCount = 0
             speech.start()
         } else {
             speech.stop()
